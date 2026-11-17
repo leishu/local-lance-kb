@@ -3,6 +3,9 @@
 venv/
 .pip-tmp/
 
+# WorkBuddy 会话记忆与项目状态：本机产物，不进版本库
+.workbuddy/
+
 # 知识库运行时数据：LanceDB 表 + config.json，每台机器各自生成
 lance-kb/data/
 
