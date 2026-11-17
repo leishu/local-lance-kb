@@ -140,6 +140,24 @@ def main() -> int:
     add_empty = kb.add_paths([os.path.join(TMP, "不存在")])
     check("空路径给出失败说明", bool(add_empty["failed"]), str(add_empty))
 
+    print("\n[13] 看板上传（add_uploads）")
+    up = kb.add_uploads([
+        ("拖拽测试.md", "# 拖拽上传\n\n## 说明\n\n从看板拖进来的文件会落到 inbox 再入库。\n".encode()),
+        ("空白.txt", b""),
+        ("超限.bin", b"x" * (kb.MAX_UPLOAD_BYTES + 1)),
+    ], tags="上传")
+    check("入库 1 个有效文件", up["added"] == 1, str(up))
+    check("落地在 inbox 里", any("inbox" in p for p in up["saved"]), str(up["saved"]))
+    check("超限的被拒收", any("超限" in r["name"] for r in up["rejected"]), str(up["rejected"]))
+    names = [os.path.basename(p) for p in up["saved"]]
+    check("文件名里的路径被剥掉", all("/" not in n and "\\" not in n for n in names), str(names))
+    again = kb.add_uploads([("拖拽测试.md",
+                             "# 拖拽上传\n\n## 说明\n\n从看板拖进来的文件会落到 inbox 再入库。\n".encode())])
+    check("重复上传按哈希跳过", again["skipped"] == 1 and not again["added"], str(again))
+    hit = kb.search("拖拽进来会落到哪里")
+    check("上传的内容能被检索到",
+          bool(hit.get("hits")) and "拖拽" in hit["hits"][0]["doc_name"], str(hit.get("hits"))[:80])
+
     print()
     if FAILED:
         print(f"× {len(FAILED)} 项失败：" + "、".join(FAILED))

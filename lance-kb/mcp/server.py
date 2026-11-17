@@ -378,8 +378,8 @@ TOOLS = [
     {
         "name": "open_dashboard",
         "description": "在对话下方打开本地知识库看板：规模 KPI、类型分布、标签、文档清单与片段浏览，"
-                       "支持按类型/标签/关键词筛选，点文档看它的片段。用户想看「库里都有什么」"
-                       "或说「打开看板」时调用。",
+                       "支持按类型/标签/关键词筛选，点文档看它的片段；看板里还能直接把文件拖进来入库。"
+                       "用户想看「库里都有什么」、说「打开看板」，或想自己传文件时调用。",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -539,11 +539,13 @@ def call_tool(name: str, args: dict) -> dict:
     if name == "open_dashboard":
         data = kb.dashboard_payload()
         m = data["meta"]
+        tip = "文件可以直接拖进看板入库。" if INGEST["port"] else ""
         if not m["docs_total"]:
-            msg = "看板已打开，但库里还没有任何文档 —— 先 kb_add 收录一个目录或一段文字。"
+            msg = ("看板已打开，但库里还没有任何文档 —— 把文件拖进看板的「添加文件」区，"
+                   "或让我 kb_add 收录一个目录。")
         else:
             msg = (f"已打开知识库看板：{m['docs_total']} 个文档、{m['chunks_total']} 个片段"
-                   f"（{m['embedder']}）。可按类型/标签/关键词筛选，点文档看它的片段。")
+                   f"（{m['embedder']}）。可按类型/标签/关键词筛选，点文档看它的片段。{tip}")
         return {
             "content": [{"type": "text", "text": msg}],
             "structuredContent": {"opened": True, "docs": m["docs_total"],
