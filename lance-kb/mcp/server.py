@@ -21,7 +21,9 @@ import gzip
 import hashlib
 import json
 import os
+import secrets
 import sys
+import threading
 import traceback
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -42,6 +44,149 @@ def _plugin_version() -> str:
             return str(json.load(fh).get("version") or "0.0.0")
     except (OSError, ValueError):
         return "0.0.0"
+
+
+# --------------------------------------------------------------------------- #
+# 看板的上传端口
+# --------------------------------------------------------------------------- #
+# 看板是 webview 里的静态 HTML，碰不到本地磁盘。所以由这个进程（它本来就在跑）
+# 开一个只监听 127.0.0.1 的小 HTTP 服务：看板把文件内容 POST 过来，这里落盘再入库。
+# 端口交给系统分配、每次启动换一个随机 token —— 避免别的网页顺手往库里塞东西。
+
+INGEST = {"port": 0, "token": "", "error": ""}
+MAX_BODY = 64 * 1024 * 1024
+
+
+def ingest_info() -> dict:
+    if not INGEST["port"]:
+        return {"url": "", "token": "", "ready": False, "error": INGEST["error"]}
+    return {"url": f"http://127.0.0.1:{INGEST['port']}", "token": INGEST["token"],
+            "ready": True, "error": ""}
+
+
+def _dashboard_data() -> dict:
+    """看板载荷：比 dashboard_payload 多一份上传端口信息。"""
+    data = kb.dashboard_payload()
+    data.setdefault("meta", {})["ingest"] = ingest_info()
+    return data
+
+
+def _send_json(handler, code: int, obj: dict) -> None:
+    body = json.dumps(obj, ensure_ascii=False).encode("utf-8")
+    handler.send_response(code)
+    handler.send_header("Content-Type", "application/json; charset=utf-8")
+    handler.send_header("Content-Length", str(len(body)))
+    handler.send_header("Access-Control-Allow-Origin", "*")
+    handler.send_header("Cache-Control", "no-store")
+    handler.end_headers()
+    handler.wfile.write(body)
+
+
+def _make_handler():
+    from http.server import BaseHTTPRequestHandler
+
+    class IngestHandler(BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+
+        def log_message(self, fmt, *a):    # 默认会往 stderr 刷日志，静音
+            pass
+
+        def _cors(self) -> None:
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+            self.send_header("Access-Control-Allow-Headers", "content-type")
+            # Chrome 的 Private Network Access：网页访问 127.0.0.1 要先过这个预检
+            self.send_header("Access-Control-Allow-Private-Network", "true")
+            self.send_header("Access-Control-Max-Age", "600")
+
+        def do_OPTIONS(self):
+            self.send_response(204)
+            self._cors()
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+
+        def do_GET(self):
+            path = self.path.split("?")[0].rstrip("/") or "/"
+            try:
+                if path == "/ping":
+                    with kb.KB_LOCK:
+                        s = kb.stats(include_backends=False)
+                    _send_json(self, 200, {"ok": True, "docs": s["docs"],
+                                           "chunks": s["chunks"],
+                                           "embedder": s["embedder"]["name"]})
+                elif path == "/payload":
+                    with kb.KB_LOCK:
+                        data = _dashboard_data()
+                    _send_json(self, 200, data)
+                else:
+                    _send_json(self, 404, {"ok": False, "error": "not found"})
+            except Exception as exc:
+                log(traceback.format_exc())
+                _send_json(self, 500, {"ok": False, "error": str(exc)})
+
+        def do_POST(self):
+            path = self.path.split("?")[0].rstrip("/") or "/"
+            if path != "/ingest":
+                _send_json(self, 404, {"ok": False, "error": "not found"})
+                return
+            try:
+                length = int(self.headers.get("Content-Length") or 0)
+            except ValueError:
+                length = 0
+            if length <= 0 or length > MAX_BODY:
+                _send_json(self, 413, {"ok": False, "error": "请求体为空或过大"})
+                return
+            try:
+                req = json.loads(self.rfile.read(length).decode("utf-8"))
+            except Exception as exc:
+                _send_json(self, 400, {"ok": False, "error": f"请求体不是 JSON：{exc}"})
+                return
+
+            if not secrets.compare_digest(str(req.get("token") or ""), INGEST["token"]):
+                _send_json(self, 403, {"ok": False, "error": "token 不正确（看板可能已过期，重新打开）"})
+                return
+
+            files = []
+            for item in req.get("files") or []:
+                name = str(item.get("name") or "")
+                try:
+                    data = base64.b64decode(str(item.get("b64") or ""), validate=True)
+                except Exception:
+                    _send_json(self, 400, {"ok": False, "error": f"{name} 的 base64 不合法"})
+                    return
+                if data:
+                    files.append((name, data))
+            if not files:
+                _send_json(self, 400, {"ok": False, "error": "没有收到文件内容"})
+                return
+
+            try:
+                result = kb.add_uploads(files, tags=req.get("tags"))
+            except Exception as exc:
+                log(traceback.format_exc())
+                _send_json(self, 500, {"ok": False, "error": str(exc)})
+                return
+            _send_json(self, 200, dict(result, ok=True))
+
+    return IngestHandler
+
+
+def start_ingest_server() -> None:
+    from http.server import ThreadingHTTPServer
+
+    INGEST["token"] = secrets.token_urlsafe(18)
+    try:
+        httpd = ThreadingHTTPServer(("127.0.0.1", 0), _make_handler())
+    except OSError as exc:
+        INGEST["error"] = f"端口绑定失败：{exc}"
+        log(f"上传端口未启动：{exc}")
+        return
+    httpd.daemon_threads = True
+    INGEST["port"] = httpd.server_address[1]
+    threading.Thread(target=httpd.serve_forever, name="lance-kb-ingest",
+                     daemon=True).start()
+    log(f"上传端口就绪 http://127.0.0.1:{INGEST['port']}（仅本机 + 随机 token）")
+
 
 
 VERSION = _plugin_version()
@@ -430,7 +575,7 @@ def render_dashboard() -> str:
         tpl = fh.read()
     if PAYLOAD_PLACEHOLDER not in tpl:
         raise RuntimeError(f"看板模板缺少 {PAYLOAD_PLACEHOLDER} 占位符")
-    payload = kb.dashboard_payload()
+    payload = _dashboard_data()
     blob = base64.b64encode(gzip.compress(_payload_bytes(payload), 9)).decode("ascii")
     return tpl.replace(PAYLOAD_PLACEHOLDER, blob)
 
@@ -470,7 +615,10 @@ def handle(req: dict) -> dict | None:
         return ok({"tools": TOOLS})
     if method == "tools/call":
         try:
-            return ok(call_tool(params.get("name"), dict(params.get("arguments") or {})))
+            # 上传线程可能正在写库，工具调用与它串行，别让两条线程同时碰表
+            with kb.KB_LOCK:
+                result = call_tool(params.get("name"), dict(params.get("arguments") or {}))
+            return ok(result)
         except kb.NeedReindex as exc:
             return ok({"content": [{"type": "text", "text": str(exc)}],
                        "isError": True})
@@ -488,10 +636,12 @@ def handle(req: dict) -> dict | None:
     if method == "resources/read":
         uri = str(params.get("uri") or "")
         if uri.startswith(DASHBOARD_URI):
+            with kb.KB_LOCK:
+                html = render_dashboard()
             return ok({"contents": [{
                 "uri": uri,
                 "mimeType": "text/html;profile=mcp-app",
-                "text": render_dashboard(),
+                "text": html,
             }]})
         return err(-32002, f"未知资源: {uri}")
     if method == "prompts/list":
@@ -501,6 +651,7 @@ def handle(req: dict) -> dict | None:
 
 def main() -> int:
     log(f"start, kb_home={kb.KB_HOME}")
+    start_ingest_server()
     for line in sys.stdin:
         line = line.strip()
         if not line:

@@ -29,6 +29,7 @@ import json
 import os
 import re
 import sys
+import threading
 import time
 from datetime import datetime, timezone
 
@@ -44,6 +45,14 @@ KB_HOME = os.path.abspath(os.environ.get("LANCE_KB_HOME")
                           or os.path.join(PLUGIN_ROOT, "data"))
 LANCE_DIR = os.path.join(KB_HOME, "lancedb")
 CONFIG_PATH = os.path.join(KB_HOME, "config.json")
+INBOX_DIR = os.path.join(KB_HOME, "inbox")
+
+# MCP 主循环和看板的上传端口是两个线程，都碰 LanceDB 表，必须串行。
+# RLock 是为了让 add_uploads → add_paths 这种嵌套调用不死锁。
+KB_LOCK = threading.RLock()
+
+MAX_UPLOAD_BYTES = 8 * 1024 * 1024
+
 
 T_CHUNKS = "chunks"
 T_DOCS = "docs"
@@ -369,6 +378,74 @@ def _retag(chunks_tbl, docs_tbl, doc: dict, tags: str) -> None:
             chunks_tbl.update(f"doc_id = {_q(doc['doc_id'])}", {"tags": tags})
         except Exception:
             pass
+
+
+def _safe_filename(name: str) -> str:
+    """上传来的文件名不可信：去目录、去控制字符、限长，别让 ../ 跑出 inbox。"""
+    base = os.path.basename(str(name or "").replace("\\", "/")).strip()
+    base = re.sub(r'[\x00-\x1f<>:"|?*]', "_", base)
+    base = base.strip(". ") or "upload.txt"
+    if len(base) > 120:
+        stem, ext = os.path.splitext(base)
+        base = stem[:max(1, 120 - len(ext))] + ext
+    return base
+
+
+def save_upload(name: str, data: bytes) -> str:
+    """把上传内容落到 inbox/，返回落地路径。
+
+    同名但内容不同就加序号 —— 直接覆盖会让旧文档被当成「内容变了」而更新，
+    而用户本意其实是传了两份不同的东西。
+    """
+    if len(data) > MAX_UPLOAD_BYTES:
+        raise ValueError(f"超过 {MAX_UPLOAD_BYTES // 1024 // 1024}MB 上限")
+    os.makedirs(INBOX_DIR, exist_ok=True)
+    safe = _safe_filename(name)
+    stem, ext = os.path.splitext(safe)
+    path = os.path.join(INBOX_DIR, safe)
+    n = 1
+    while os.path.exists(path):
+        try:
+            with open(path, "rb") as fh:
+                if fh.read() == data:
+                    return path          # 一模一样，复用；入库时会按内容哈希跳过
+        except OSError:
+            pass
+        path = os.path.join(INBOX_DIR, f"{stem}-{n}{ext}")
+        n += 1
+    with open(path, "wb") as fh:
+        fh.write(data)
+    return path
+
+
+def add_uploads(files, tags=None) -> dict:
+    """看板上传的入口：落盘 → 走正常入库 → 返回摘要。files = [(文件名, bytes)]。"""
+    tag_str = _norm_tags(tags)
+    saved, rejected = [], []
+    for name, data in files:
+        try:
+            saved.append(save_upload(name, data))
+        except Exception as exc:
+            rejected.append({"name": name, "error": str(exc)})
+    if not saved:
+        return {"saved": [], "rejected": rejected, "added": 0, "updated": 0,
+                "skipped": 0, "chunks": 0,
+                "message": "没有可入库的文件，检查格式或大小。"}
+    with KB_LOCK:
+        # record_source=False：inbox 是暂存区，不该被当成「登记过的来源目录」，
+        # 否则 kb_sync 会去重扫 inbox，还可能把用户从看板删掉的文档又加回来。
+        report = add_paths(saved, tags=tag_str, record_source=False)
+    return {
+        "saved": [os.path.relpath(p, KB_HOME) for p in saved],
+        "rejected": rejected,
+        "added": len(report["added"]),
+        "updated": len(report["updated"]),
+        "skipped": len(report["skipped"]),
+        "failed": [f.get("path") for f in report["failed"]],
+        "chunks": report["chunks"],
+        "total_docs": report["total_docs"],
+        "embedder": report["embedder"],
+    }
 
 
 def add_paths(paths, tags=None, force=False, recursive=True, chunk_size=None,

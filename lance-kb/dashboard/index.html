@@ -84,6 +84,27 @@
   }
   .ghost:hover { color: var(--text); }
 
+  .drop {
+    border: 1px dashed #33405a; border-radius: 10px; padding: 14px 12px;
+    text-align: center; background: var(--panel-2); transition: border-color .15s, background .15s;
+  }
+  .drop.hot { border-color: var(--teal); background: #112523; }
+  .drop.off { opacity: .5; }
+  .drop .main { font-size: 12px; color: var(--muted); }
+  .drop .sub { margin-top: 7px; font-size: 11px; color: var(--muted-2); line-height: 1.5; }
+  .drop button { margin: 0 2px; }
+
+  .ingest-tags {
+    width: 100%; margin-top: 8px; background: var(--panel-2); border: 1px solid var(--line);
+    color: var(--text); border-radius: 8px; padding: 6px 9px; font-size: 12px;
+    outline: none; font-family: inherit;
+  }
+  .ingest-tags:focus { border-color: #33507f; }
+  #ingestLog { margin-top: 8px; font-size: 11.5px; line-height: 1.65; color: var(--muted); }
+  #ingestLog .ok { color: var(--teal); }
+  #ingestLog .bad { color: var(--red); }
+  #ingestLog .busy { color: var(--blue); }
+
   table { width: 100%; border-collapse: collapse; }
   th, td { text-align: left; padding: 7px 10px; font-size: 12px; border-bottom: 1px solid var(--line-soft); }
   th { color: var(--muted); font-weight: 500; cursor: pointer; user-select: none; white-space: nowrap; }
@@ -126,6 +147,18 @@
 
   <div class="grid">
     <div>
+      <div class="card" style="margin-bottom:12px">
+        <header><h2>添加文件</h2><span class="hint" id="ingestHint">-</span></header>
+        <div class="body">
+          <div class="drop" id="drop">
+            <div class="main">把文件拖到这里，或 <button class="ghost" id="pick">选择文件</button></div>
+            <div class="sub" id="dropSub">md · txt · pdf · docx · html · csv · json · 代码，单个 ≤ 8MB</div>
+          </div>
+          <input type="file" id="fileInput" multiple hidden />
+          <input type="text" id="ingestTags" class="ingest-tags" placeholder="标签（可选，逗号分隔）" />
+          <div id="ingestLog"></div>
+        </div>
+      </div>
       <div class="card" style="margin-bottom:12px">
         <header><h2>文档类型</h2><span class="hint">点击筛选</span></header>
         <div class="body"><div class="bars" id="bars"></div></div>
@@ -212,6 +245,8 @@
   })();
 
   const state = { type: '', tag: '', q: '', order: 'updated', docId: '' };
+  // 上传端口由 MCP 服务注入：只监听 127.0.0.1，带一次性 token
+  const ING = { url: '', token: '', ready: false, error: '' };
 
   function render(data) {
     const meta = data.meta || {}, stats = data.stats || {};
@@ -225,6 +260,7 @@
     badges.push('<span class="badge">磁盘 <b>' + fmtBytes(meta.db_bytes) + '</b></span>');
     if (meta.caveat) badges.push('<span class="badge warn">兜底向量</span>');
     $('badges').innerHTML = badges.join('');
+    setIngest(meta);
 
     const kp = [
       ['文档', fmt(meta.docs_total), '个'],
@@ -259,7 +295,8 @@
 
     $('foot').innerHTML =
       '生成于 ' + escapeHtml((meta.generated_at || '').replace('T', ' ')) +
-      ' · 看板是打开那一刻的快照，入库/删除后重新打开才会更新。' +
+      (ING.ready ? ' · 在本页添加文件后会自动刷新。'
+                 : ' · 看板是打开那一刻的快照，入库后重新打开才会更新。') +
       (meta.caveat ? '<br><span class="caveat">' + escapeHtml(meta.caveat) + '</span>' : '');
 
     window.__kb = { docs: docs, chunks: chunks };
@@ -340,6 +377,86 @@
     });
   }
 
+  // ---- 添加文件 ----------------------------------------------------------- //
+
+  function setIngest(meta) {
+    const cfg = (meta || {}).ingest || {};
+    ING.url = cfg.url || '';
+    ING.token = cfg.token || '';
+    ING.ready = !!cfg.ready && !!ING.url;
+    ING.error = cfg.error || '';
+    $('ingestHint').textContent = ING.ready ? '拖进来就入库' : '不可用';
+    $('drop').classList.toggle('off', !ING.ready);
+    $('dropSub').textContent = ING.ready
+      ? 'md · txt · pdf · docx · html · csv · json · 代码，单个 ≤ 8MB'
+      : (ING.error || '接收端口未启动：重启 WorkBuddy 后重新打开看板');
+  }
+
+  function note(msg, cls) {
+    $('ingestLog').innerHTML = '<span class="' + (cls || '') + '">' + escapeHtml(msg) + '</span>';
+  }
+
+  function toB64(file) {
+    return new Promise((resolve, reject) => {
+      const fr = new FileReader();
+      fr.onload = () => {
+        const s = String(fr.result || '');
+        resolve(s.slice(s.indexOf(',') + 1));
+      };
+      fr.onerror = () => reject(fr.error || new Error('读取失败'));
+      fr.readAsDataURL(file);
+    });
+  }
+
+  async function addFiles(fileList) {
+    const files = Array.from(fileList || []);
+    if (!files.length) return;
+    if (!ING.ready) { note('页面里入库不可用：' + (ING.error || '接收端口未启动'), 'bad'); return; }
+    const limit = 8 * 1024 * 1024;
+    const ok = files.filter((f) => f.size <= limit);
+    const big = files.filter((f) => f.size > limit);
+    if (big.length) note('跳过超过 8MB 的：' + big.map((f) => f.name).join('、'), 'bad');
+    if (!ok.length) return;
+    note('正在入库 ' + ok.length + ' 个文件…', 'busy');
+    let payload;
+    try {
+      payload = await Promise.all(ok.map(async (f) => ({ name: f.name, b64: await toB64(f) })));
+    } catch (e) { note('读取文件失败：' + e.message, 'bad'); return; }
+
+    let res;
+    try {
+      const r = await fetch(ING.url + '/ingest', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ token: ING.token, tags: $('ingestTags').value.trim(), files: payload })
+      });
+      res = await r.json().catch(() => ({}));
+      if (!r.ok || !res.ok) { note('入库失败：' + (res.error || ('HTTP ' + r.status)), 'bad'); return; }
+    } catch (e) {
+      note('连不上本地接收端口（' + e.message + '）。宿主可能拦了 127.0.0.1 请求，'
+         + '改用 /收录资料 或在对话里让我入库。', 'bad');
+      return;
+    }
+
+    const bits = ['新增 ' + res.added, '更新 ' + res.updated, '跳过 ' + res.skipped,
+                  '切出 ' + res.chunks + ' 段', '库里共 ' + res.total_docs + ' 个文档'];
+    if ((res.rejected || []).length) {
+      bits.push('拒收 ' + res.rejected.map((x) => x.name + '（' + x.error + '）').join('、'));
+    }
+    if ((res.failed || []).length) bits.push('解析失败 ' + res.failed.length + ' 个');
+    note(bits.join('；'), (res.added || res.updated) ? 'ok' : '');
+    await refresh();
+  }
+
+  async function refresh() {
+    if (!ING.url) return;
+    try {
+      const r = await fetch(ING.url + '/payload', { cache: 'no-store' });
+      if (!r.ok) return;
+      render(await r.json());
+    } catch (e) { /* 刷新失败就保持当前画面，不打扰用户 */ }
+  }
+
   function escapeHtml(s) {
     return String(s == null ? '' : s).replace(/[&<>"']/g, (c) =>
       ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c]);
@@ -350,6 +467,27 @@
   $('order').addEventListener('change', (e) => { state.order = e.target.value; renderList(); });
   $('reset').addEventListener('click', () => {
     state.type = ''; state.tag = ''; state.q = ''; $('q').value = ''; renderList();
+  });
+
+  $('pick').addEventListener('click', () => $('fileInput').click());
+  $('drop').addEventListener('click', (e) => {
+    if (e.target.tagName !== 'BUTTON') $('fileInput').click();
+  });
+  $('fileInput').addEventListener('change', (e) => {
+    addFiles(e.target.files);
+    e.target.value = '';
+  });
+  ['dragenter', 'dragover'].forEach((ev) => document.addEventListener(ev, (e) => {
+    e.preventDefault();                       // 别让浏览器直接打开丢掉的文件
+    if (ING.ready) $('drop').classList.add('hot');
+  }));
+  document.addEventListener('dragleave', (e) => {
+    if (!e.relatedTarget) $('drop').classList.remove('hot');
+  });
+  document.addEventListener('drop', (e) => {
+    e.preventDefault();
+    $('drop').classList.remove('hot');
+    addFiles(e.dataTransfer && e.dataTransfer.files);
   });
 })();
 </script>
