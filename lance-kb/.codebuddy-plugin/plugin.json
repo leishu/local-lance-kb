@@ -1,0 +1,35 @@
+{
+  "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
+  "name": "lance-kb",
+  "version": "0.1.0",
+  "description": "本地知识库：把本机文档（md/txt/pdf/docx/html/csv/json/代码）切块向量化进 LanceDB，提供混合检索（向量 + 全文 RRF）、带出处的片段回取、增量同步与文档管理，以及一个可浏览的库看板（MCP App）。全程离线。",
+  "author": {
+    "name": "leishu"
+  },
+  "license": "MIT",
+  "category": "productivity",
+  "keywords": [
+    "知识库",
+    "本地知识库",
+    "lancedb",
+    "向量检索",
+    "rag",
+    "全文检索",
+    "文档索引",
+    "嵌入",
+    "mcp-app"
+  ],
+  "mcpServers": {
+    "lance-kb": {
+      "command": "/bin/sh",
+      "args": [
+        "${CODEBUDDY_PLUGIN_ROOT}/mcp/launch.sh"
+      ],
+      "env": {
+        "LANCE_KB_HOME": "${CODEBUDDY_PLUGIN_ROOT}/data"
+      }
+    }
+  },
+  "skills": "./skills",
+  "commands": "./commands"
+}

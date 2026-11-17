@@ -1,0 +1,31 @@
+# 虚拟环境与依赖安装产物（474M，不入库）
+.venv/
+venv/
+.pip-tmp/
+
+# 知识库运行时数据：LanceDB 表 + config.json，每台机器各自生成
+lance-kb/data/
+
+# Python 缓存
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# 临时目录与回收站
+.tmp/
+.Trash-0/
+
+# IDE
+.idea/
+*.iml
+.vscode/
+
+# install.sh 改写市场清单时留的备份
+*.bak-*
+*.bak
+
+# 看板快照是生成物，用 open_dashboard 实时渲染即可
+预览-本地知识库看板.html
+
+# 系统垃圾
+.DS_Store

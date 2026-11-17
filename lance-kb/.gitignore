@@ -1,0 +1,9 @@
+# 知识库数据与虚拟环境不入库
+data/
+.venv/
+venv/
+.pip-tmp/
+__pycache__/
+*.pyc
+dashboard/data.dev.json
+.DS_Store

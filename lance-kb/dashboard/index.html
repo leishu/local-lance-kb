@@ -1,0 +1,357 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>本地知识库</title>
+<!--
+  单文件看板，不需要构建：服务端把 __LANCE_KB_DATA_B64__ 换成 gzip+base64 的载荷，
+  页面自己解压渲染。没有注入（直接在浏览器打开）时提示数据未注入。
+-->
+<style>
+  :root {
+    --bg: #0e1014; --bg2: #12151b; --panel: #161a21; --panel-2: #1b2029;
+    --line: #262c37; --line-soft: #1f242d;
+    --text: #e6e9f0; --muted: #8892a3; --muted-2: #6b7484;
+    --teal: #38cab2; --blue: #4c8dff; --violet: #a06bff; --orange: #ffa64d;
+    --pink: #e868a0; --red: #e2686a; --radius: 12px;
+  }
+  * { box-sizing: border-box; }
+  html, body {
+    margin: 0; padding: 0; background: var(--bg); color: var(--text);
+    font-family: system-ui, -apple-system, "PingFang SC", "Microsoft YaHei", "Segoe UI", sans-serif;
+    font-size: 13px; -webkit-font-smoothing: antialiased;
+  }
+  .app { max-width: 1500px; margin: 0 auto; padding: 18px 20px 48px; }
+
+  .topbar { display: flex; align-items: flex-end; justify-content: space-between; gap: 16px; margin-bottom: 16px; }
+  .brand h1 { margin: 0; font-size: 19px; font-weight: 650; letter-spacing: .2px; }
+  .brand p { margin: 5px 0 0; color: var(--muted); font-size: 12px; }
+  .brand code { color: var(--muted-2); font-family: ui-monospace, Menlo, Consolas, monospace; font-size: 11.5px; }
+  .badges { display: flex; gap: 8px; flex-wrap: wrap; justify-content: flex-end; }
+  .badge {
+    border: 1px solid var(--line); background: var(--panel); color: var(--muted);
+    padding: 5px 10px; border-radius: 999px; font-size: 11.5px; white-space: nowrap;
+  }
+  .badge b { color: var(--text); font-weight: 600; }
+  .badge.warn { border-color: #4a3a22; background: #221b12; color: var(--orange); }
+
+  .kpis { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 10px; margin-bottom: 14px; }
+  .kpi { background: var(--panel); border: 1px solid var(--line-soft); border-radius: var(--radius); padding: 12px 14px; }
+  .kpi .k { color: var(--muted); font-size: 11.5px; margin-bottom: 6px; }
+  .kpi .v { font-size: 21px; font-weight: 640; letter-spacing: .3px; }
+  .kpi .u { font-size: 11.5px; color: var(--muted-2); margin-left: 4px; font-weight: 400; }
+
+  .grid { display: grid; grid-template-columns: 320px minmax(0, 1fr); gap: 12px; align-items: start; }
+  @media (max-width: 900px) { .grid { grid-template-columns: 1fr; } }
+
+  .card { background: var(--panel); border: 1px solid var(--line-soft); border-radius: var(--radius); }
+  .card > header {
+    display: flex; align-items: center; justify-content: space-between; gap: 10px;
+    padding: 11px 14px; border-bottom: 1px solid var(--line-soft);
+  }
+  .card > header h2 { margin: 0; font-size: 12.5px; font-weight: 600; letter-spacing: .3px; color: var(--text); }
+  .card > header .hint { color: var(--muted-2); font-size: 11px; }
+  .card .body { padding: 12px 14px; }
+
+  .bars { display: flex; flex-direction: column; gap: 9px; }
+  .bar-row { cursor: pointer; }
+  .bar-row .lbl { display: flex; justify-content: space-between; font-size: 12px; margin-bottom: 4px; color: var(--muted); }
+  .bar-row .lbl b { color: var(--text); font-weight: 550; }
+  .bar-track { height: 7px; background: var(--panel-2); border-radius: 99px; overflow: hidden; }
+  .bar-fill { height: 100%; border-radius: 99px; background: linear-gradient(90deg, var(--teal), var(--blue)); transition: width .35s ease; }
+  .bar-row.active .lbl b, .bar-row.active .lbl span:first-child { color: var(--teal); }
+
+  .tags { display: flex; flex-wrap: wrap; gap: 6px; }
+  .tag {
+    border: 1px solid var(--line); background: var(--panel-2); color: var(--muted);
+    border-radius: 999px; padding: 3px 9px; font-size: 11.5px; cursor: pointer;
+  }
+  .tag:hover { color: var(--text); border-color: #33405a; }
+  .tag.active { background: #14332f; border-color: #1f5d55; color: var(--teal); }
+  .tag .n { color: var(--muted-2); margin-left: 4px; }
+
+  .toolbar { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; padding: 10px 14px; border-bottom: 1px solid var(--line-soft); }
+  input[type="search"], select {
+    background: var(--panel-2); border: 1px solid var(--line); color: var(--text);
+    border-radius: 8px; padding: 6px 9px; font-size: 12px; outline: none; font-family: inherit;
+  }
+  input[type="search"] { flex: 1; min-width: 140px; }
+  input[type="search"]:focus, select:focus { border-color: #33507f; }
+  .ghost {
+    background: transparent; border: 1px solid var(--line); color: var(--muted);
+    border-radius: 8px; padding: 6px 10px; font-size: 12px; cursor: pointer; font-family: inherit;
+  }
+  .ghost:hover { color: var(--text); }
+
+  table { width: 100%; border-collapse: collapse; }
+  th, td { text-align: left; padding: 7px 10px; font-size: 12px; border-bottom: 1px solid var(--line-soft); }
+  th { color: var(--muted); font-weight: 500; cursor: pointer; user-select: none; white-space: nowrap; }
+  th:hover { color: var(--text); }
+  td { color: var(--text); }
+  td.mono, .mono { font-family: ui-monospace, Menlo, Consolas, monospace; font-size: 11.5px; }
+  td .path { color: var(--muted-2); font-size: 11px; display: block; margin-top: 2px; word-break: break-all; }
+  tbody tr { cursor: pointer; }
+  tbody tr:hover { background: #1a1f28; }
+  tbody tr.active { background: #16222c; box-shadow: inset 2px 0 0 var(--teal); }
+  .pill { border-radius: 6px; padding: 1px 6px; font-size: 11px; background: var(--panel-2); color: var(--muted); }
+  .empty { padding: 26px 14px; text-align: center; color: var(--muted-2); font-size: 12px; }
+
+  .chunks { display: flex; flex-direction: column; gap: 8px; max-height: 460px; overflow: auto; padding: 12px 14px; }
+  .chunk { border: 1px solid var(--line-soft); border-radius: 10px; background: var(--panel-2); padding: 9px 11px; }
+  .chunk .meta { display: flex; gap: 8px; align-items: center; color: var(--muted-2); font-size: 11px; margin-bottom: 5px; }
+  .chunk .meta .h { color: var(--teal); }
+  .chunk p { margin: 0; color: #cfd6e2; font-size: 12px; line-height: 1.65; white-space: pre-wrap; word-break: break-word; }
+  .chunk p.clamp { display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical; overflow: hidden; }
+  .chunk .more { margin-top: 5px; color: var(--blue); font-size: 11.5px; cursor: pointer; }
+
+  footer { margin-top: 14px; color: var(--muted-2); font-size: 11.5px; line-height: 1.7; }
+  footer .caveat { color: var(--orange); }
+  ::-webkit-scrollbar { width: 9px; height: 9px; }
+  ::-webkit-scrollbar-thumb { background: #2a3240; border-radius: 99px; }
+  ::-webkit-scrollbar-track { background: transparent; }
+</style>
+</head>
+<body>
+<div class="app">
+  <div class="topbar">
+    <div class="brand">
+      <h1>本地知识库</h1>
+      <p id="sub">正在加载…</p>
+    </div>
+    <div class="badges" id="badges"></div>
+  </div>
+
+  <div class="kpis" id="kpis"></div>
+
+  <div class="grid">
+    <div>
+      <div class="card" style="margin-bottom:12px">
+        <header><h2>文档类型</h2><span class="hint">点击筛选</span></header>
+        <div class="body"><div class="bars" id="bars"></div></div>
+      </div>
+      <div class="card">
+        <header><h2>标签</h2><span class="hint" id="tagHint">-</span></header>
+        <div class="body"><div class="tags" id="tags"></div></div>
+      </div>
+    </div>
+
+    <div class="card">
+      <header>
+        <h2>文档清单</h2>
+        <span class="hint" id="docCount">-</span>
+      </header>
+      <div class="toolbar">
+        <input id="q" type="search" placeholder="按文件名 / 路径筛选…" />
+        <select id="order">
+          <option value="updated">按更新时间</option>
+          <option value="chunks">按片段数</option>
+          <option value="size">按字数</option>
+          <option value="name">按名称</option>
+        </select>
+        <button class="ghost" id="reset">清空筛选</button>
+      </div>
+      <div id="tableWrap"></div>
+    </div>
+  </div>
+
+  <div class="card" style="margin-top:12px">
+    <header>
+      <h2 id="chunkTitle">片段浏览</h2>
+      <span class="hint" id="chunkHint">点上方任一文档查看它的片段</span>
+    </header>
+    <div class="chunks" id="chunks"></div>
+  </div>
+
+  <footer id="foot"></footer>
+</div>
+
+<script id="lance-kb-data" type="text/plain">__LANCE_KB_DATA_B64__</script>
+<script>
+(function () {
+  const $ = (id) => document.getElementById(id);
+  const fmt = (n) => (n == null ? '-' : Number(n).toLocaleString('zh-CN'));
+  const fmtChars = (n) => {
+    n = Number(n || 0);
+    if (n >= 1e6) return (n / 1e6).toFixed(1) + 'M';
+    if (n >= 1e4) return (n / 1e3).toFixed(1) + 'k';
+    return String(n);
+  };
+  const fmtBytes = (n) => {
+    n = Number(n || 0);
+    const u = ['B', 'KB', 'MB', 'GB'];
+    let i = 0;
+    while (n >= 1024 && i < u.length - 1) { n /= 1024; i++; }
+    return n.toFixed(i ? 1 : 0) + ' ' + u[i];
+  };
+
+  async function inflate(b64) {
+    const bin = Uint8Array.from(atob(b64), (c) => c.charCodeAt(0));
+    if (typeof DecompressionStream === 'undefined') {
+      return JSON.parse(new TextDecoder().decode(bin));
+    }
+    const stream = new Blob([bin]).stream().pipeThrough(new DecompressionStream('gzip'));
+    return JSON.parse(await new Response(stream).text());
+  }
+
+  function fail(msg) {
+    $('sub').textContent = msg;
+    $('kpis').innerHTML = '<div class="empty">' + msg + '</div>';
+  }
+
+  (async function () {
+    const holder = $('lance-kb-data');
+    const raw = (holder ? holder.textContent : '').trim();
+    if (!raw || raw.indexOf('__LANCE_KB') === 0) {
+      fail('数据未注入：请在 WorkBuddy 里通过 open_dashboard 打开看板（或先跑 kb.py export-dev 后本地预览）。');
+      return;
+    }
+    let data;
+    try { data = await inflate(raw); } catch (e) { fail('载荷解析失败：' + e.message); return; }
+    render(data);
+  })();
+
+  const state = { type: '', tag: '', q: '', order: 'updated', docId: '' };
+
+  function render(data) {
+    const meta = data.meta || {}, stats = data.stats || {};
+    const docs = data.docs || [], chunks = data.chunks || [];
+
+    $('sub').innerHTML = 'LanceDB · <code>' + escapeHtml(meta.kb_home || '-') + '</code>';
+
+    const badges = [];
+    badges.push('<span class="badge">嵌入 <b>' + escapeHtml(meta.embedder || '-') + '</b></span>');
+    badges.push('<span class="badge">全文索引 <b>' + escapeHtml(meta.fts || '未建立') + '</b></span>');
+    badges.push('<span class="badge">磁盘 <b>' + fmtBytes(meta.db_bytes) + '</b></span>');
+    if (meta.caveat) badges.push('<span class="badge warn">兜底向量</span>');
+    $('badges').innerHTML = badges.join('');
+
+    const kp = [
+      ['文档', fmt(meta.docs_total), '个'],
+      ['片段', fmt(meta.chunks_total), '块'],
+      ['总字数', fmtChars(stats.chars), '字'],
+      ['平均片段', fmt(stats.avg_chunk_chars), '字'],
+      ['切块 / 重叠', (stats.chunk_size || '-') + ' / ' + (stats.overlap || 0), '字']
+    ];
+    $('kpis').innerHTML = kp.map(([k, v, u]) =>
+      '<div class="kpi"><div class="k">' + k + '</div><div class="v">' + v +
+      '<span class="u">' + u + '</span></div></div>').join('');
+
+    const types = (stats.by_type || []).slice();
+    const maxDocs = Math.max(1, ...types.map((t) => t.docs));
+    $('bars').innerHTML = types.length ? types.map((t) =>
+      '<div class="bar-row" data-type="' + escapeAttr(t.type) + '">' +
+        '<div class="lbl"><span>' + escapeHtml(t.type) + '</span><b>' + fmt(t.docs) + ' 个</b></div>' +
+        '<div class="bar-track"><div class="bar-fill" style="width:' + Math.max(3, t.docs / maxDocs * 100).toFixed(1) + '%"></div></div>' +
+      '</div>').join('') : '<div class="empty">还没有文档</div>';
+    $('bars').querySelectorAll('.bar-row').forEach((el) => {
+      el.onclick = () => { state.type = state.type === el.dataset.type ? '' : el.dataset.type; renderList(); };
+    });
+
+    const tags = stats.top_tags || [];
+    $('tagHint').textContent = tags.length ? tags.length + ' 个' : '尚无标签';
+    $('tags').innerHTML = tags.length ? tags.map((t) =>
+      '<span class="tag" data-tag="' + escapeAttr(t.tag) + '">' + escapeHtml(t.tag) +
+      '<span class="n">' + t.docs + '</span></span>').join('') : '<span class="hint">入库时传 tags 就会出现在这里</span>';
+    $('tags').querySelectorAll('.tag').forEach((el) => {
+      el.onclick = () => { state.tag = state.tag === el.dataset.tag ? '' : el.dataset.tag; renderList(); };
+    });
+
+    $('foot').innerHTML =
+      '生成于 ' + escapeHtml((meta.generated_at || '').replace('T', ' ')) +
+      ' · 看板是打开那一刻的快照，入库/删除后重新打开才会更新。' +
+      (meta.caveat ? '<br><span class="caveat">' + escapeHtml(meta.caveat) + '</span>' : '');
+
+    window.__kb = { docs: docs, chunks: chunks };
+    renderList();
+    // 自动选中第一个文档，避免片段面板空着
+    const first = (docs || [])[0];
+    if (!state.docId && first) { state.docId = first.doc_id; showChunks(chunks, first.doc_id); }
+  }
+
+  function renderList() {
+    const { docs, chunks } = window.__kb || { docs: [], chunks: [] };
+    let list = docs.filter((d) => {
+      if (state.type && d.type !== state.type) return false;
+      if (state.tag && (d.tags || '').indexOf(state.tag) < 0) return false;
+      if (state.q) {
+        const q = state.q.toLowerCase();
+        if ((d.name || '').toLowerCase().indexOf(q) < 0 && (d.path || '').toLowerCase().indexOf(q) < 0) return false;
+      }
+      return true;
+    });
+    const cmp = {
+      updated: (a, b) => (b.updated_at || '').localeCompare(a.updated_at || ''),
+      chunks: (a, b) => b.chunks - a.chunks,
+      size: (a, b) => b.chars - a.chars,
+      name: (a, b) => (a.name || '').localeCompare(b.name || '')
+    }[state.order] || (() => 0);
+    list = list.slice().sort(cmp);
+
+    document.querySelectorAll('.bar-row').forEach((el) => el.classList.toggle('active', el.dataset.type === state.type));
+    document.querySelectorAll('.tag').forEach((el) => el.classList.toggle('active', el.dataset.tag === state.tag));
+
+    $('docCount').textContent = list.length + ' / ' + docs.length + ' 个文档';
+    if (!list.length) {
+      $('tableWrap').innerHTML = '<div class="empty">没有匹配的文档</div>';
+      return;
+    }
+    const rows = list.slice(0, 400).map((d) =>
+      '<tr data-id="' + escapeAttr(d.doc_id) + '"' + (d.doc_id === state.docId ? ' class="active"' : '') + '>' +
+        '<td>' + escapeHtml(d.name || '') + '<span class="path">' + escapeHtml(d.path || '') + '</span></td>' +
+        '<td><span class="pill">' + escapeHtml(d.type || '-') + '</span></td>' +
+        '<td class="mono">' + fmt(d.chunks) + '</td>' +
+        '<td class="mono">' + fmtChars(d.chars) + '</td>' +
+        '<td>' + escapeHtml(d.tags || '-') + '</td>' +
+        '<td class="mono">' + escapeHtml((d.updated_at || '').slice(0, 10)) + '</td>' +
+      '</tr>').join('');
+    $('tableWrap').innerHTML =
+      '<table><thead><tr><th data-order="name">文档</th><th data-order="type">类型</th>' +
+      '<th data-order="chunks">片段</th><th data-order="size">字数</th><th>标签</th>' +
+      '<th data-order="updated">更新</th></tr></thead><tbody>' + rows + '</tbody></table>' +
+      (list.length > 400 ? '<div class="empty">仅显示前 400 个文档，用筛选收窄范围</div>' : '');
+
+    $('tableWrap').querySelectorAll('tbody tr').forEach((tr) => {
+      tr.onclick = () => { state.docId = tr.dataset.id; showChunks(chunks, tr.dataset.id); renderList(); };
+    });
+    $('tableWrap').querySelectorAll('th[data-order]').forEach((th) => {
+      th.onclick = () => { state.order = th.dataset.order; renderList(); };
+    });
+  }
+
+  function showChunks(chunks, docId) {
+    const mine = chunks.filter((c) => c.doc_id === docId).sort((a, b) => (a.ordinal || 0) - (b.ordinal || 0));
+    const doc = ((window.__kb || {}).docs || []).find((d) => d.doc_id === docId) || {};
+    $('chunkTitle').textContent = doc.name || '片段浏览';
+    $('chunkHint').textContent = mine.length ? mine.length + ' 个片段' : '该文档的片段不在本次载荷里';
+    $('chunks').innerHTML = mine.length ? mine.map((c, i) =>
+      '<div class="chunk" data-i="' + i + '">' +
+        '<div class="meta"><span class="h">' + escapeHtml(c.heading || '（无小节）') + '</span>' +
+        '<span>#' + (c.ordinal != null ? c.ordinal : i) + '</span><span>' + fmt(c.n_chars) + ' 字</span></div>' +
+        '<p class="clamp">' + escapeHtml(c.text || '') + '</p>' +
+      '</div>').join('') : '<div class="empty">没有片段</div>';
+    $('chunks').querySelectorAll('.chunk').forEach((el) => {
+      el.onclick = () => {
+        const p = el.querySelector('p');
+        const clamped = p.classList.toggle('clamp');
+        el.style.background = clamped ? '' : '#202833';
+        el.style.borderColor = clamped ? '' : '#2f4a5c';
+      };
+    });
+  }
+
+  function escapeHtml(s) {
+    return String(s == null ? '' : s).replace(/[&<>"']/g, (c) =>
+      ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c]);
+  }
+  function escapeAttr(s) { return escapeHtml(s); }
+
+  $('q').addEventListener('input', (e) => { state.q = e.target.value.trim(); renderList(); });
+  $('order').addEventListener('change', (e) => { state.order = e.target.value; renderList(); });
+  $('reset').addEventListener('click', () => {
+    state.type = ''; state.tag = ''; state.q = ''; $('q').value = ''; renderList();
+  });
+})();
+</script>
+</body>
+</html>
