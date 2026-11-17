@@ -39,33 +39,51 @@ cd lance-kb
 .venv/bin/python tests/smoke_test.py
 ```
 
-## 二、嵌入后端（决定检索质量，先看这段）
+## 二、中文向量与中文分词（决定检索质量，先看这段）
 
-检索质量一半靠切块、一半靠向量。插件会自动挑一个能用的后端，优先级：
+检索质量一半靠切块、一半靠向量和分词。默认自动挑本机最能用的组合，不用手动配。
+
+### 向量：优先中文模型
 
 | 后端 | 怎么来的 | 适合 |
 |---|---|---|
 | `ollama` | 本机已跑 Ollama，默认模型 `bge-m3` | **推荐**。中文最强，零 Python 依赖：`ollama pull bge-m3` |
-| `fastembed` | `./install.sh --with-fastembed`，ONNX 跑 `BAAI/bge-small-zh-v1.5` | 不想装 Ollama，CPU 也快，首次会下载约 100MB 模型 |
+| `fastembed` | `./install.sh --with-fastembed`，ONNX 跑 `BAAI/bge-small-zh-v1.5`（512 维） | 不想装 Ollama 就用它。CPU 上一条片段几十毫秒，模型约 90MB 只需下一次；直连 HF 不通会自动切 hf-mirror |
 | `openai` | 环境里有 `OPENAI_API_KEY` / `LANCE_KB_OPENAI_KEY` | 有云端 key，且不在意出网 |
 | `hash` | 内置兜底，字符 n-gram 哈希 512 维 | **永远可用，但没有语义泛化能力**，只能靠全文检索那一路 |
+
+### 分词：jieba 词级索引
+
+`install.sh` 默认装 `jieba`。装上之后全文索引走**真正的中文分词**：入库时把 jieba
+切好的词用空格连成一列 `search_tokens`，索引建在它上面并指定 `base_tokenizer="whitespace"`
+—— 对 tantivy 来说每个词就是一个 token，BM25 就是在中文词上算的。查询走同一个切词函数，
+两端规则必须一致，否则分数对不上。
+
+为什么不直接用 LanceDB 的分词器：0.4x 的 native FTS 只认 simple/raw/whitespace/ngram/icu，
+**没有 jieba**；`simple` 按空白切词，整段中文会变成一个 token（等于搜不到）；`icu` 又不支持
+`language="Chinese"`。所以没装 jieba 时只能退回 `ngram(2-3)` 字符切片——能用，但索引更大、
+精度更差（`发票原件` 这种会命中很多无关的二字片段）。`kb_stats` 会显示当前用的是 `jieba`
+还是 `ngram(2-3)`，两者切换需要 `kb_reindex`。
 
 强制指定：`LANCE_KB_EMBED=ollama`（或 `fastembed` / `openai` / `hash`）。相关环境变量：
 
 ```bash
 LANCE_KB_EMBED=auto              # auto|ollama|fastembed|openai|hash
 LANCE_KB_EMBED_ORDER=ollama,hash # auto 的尝试顺序
+LANCE_KB_FTS=auto                # auto|jieba|ngram —— 全文分词方案
 LANCE_KB_OLLAMA_MODEL=bge-m3
 OLLAMA_HOST=http://127.0.0.1:11434
 LANCE_KB_ST_MODEL=BAAI/bge-small-zh-v1.5
+LANCE_KB_MODEL_CACHE=~/.cache/lance-kb  # fastembed 的模型下载目录
 LANCE_KB_OPENAI_BASE=https://api.deepseek.com/v1   # 兼容任何 OpenAI 协议端点
 LANCE_KB_OPENAI_KEY=sk-...
 LANCE_KB_HOME=/path/to/data      # 知识库放在哪，默认插件下 data/
 HF_ENDPOINT=https://hf-mirror.com  # 国内下载 fastembed 模型时用
 ```
 
-**换后端必须重建索引**：向量维度不同，工具会直接报「库里是 X 维，当前是 Y 维」，
-此时跑 `kb_reindex`（全量重建），不要试图用重新 `kb_add` 蒙过去。
+**换后端必须重建索引**：向量维度不同时工具会直接报「库里是 X 维，当前是 Y 维」；
+维度恰好相同时（`hash` 和 `bge-small-zh` 都是 512 维）则比对后端身份并报「向量空间不同，混着查会串味」。
+两种情况都跑 `kb_reindex` 全量重建，不要试图用重新 `kb_add` 蒙过去。库是空的时候会自动按新后端重建，不用管。
 
 ## 三、开始用
 
@@ -111,15 +129,15 @@ HF_ENDPOINT=https://hf-mirror.com  # 国内下载 fastembed 模型时用
 
 **切块**：先按格式解析成 `(小节标题, 正文)` 段落 —— Markdown 按 `#` 层级、PDF 按页、DOCX 按标题样式、
 CSV 每 40 行一批且每批重复表头、代码在顶层 `def/class` 处断开。再把段落按目标长度（默认 700 字）
-打包，超长段落按句号切开并带 120 字重叠。嵌入时把「小节标题」拼在正文前，标题本身也参与语义；
-全文索引建在 `search_text`（标题 + 正文）这一个字段上 —— LanceDB 的 native FTS 一次只能索引一个字段，
-而且没有 jieba，中文只能用 `ngram(2-3)` 分词（`simple` 会把整段中文当成一个词，等于搜不到）。
+打包，超长段落按句号切开并带 120 字重叠。嵌入时把「小节标题」拼在正文前，标题本身也参与语义。
+全文索引建在 `search_tokens`（jieba 切好的词，空格连接）上 —— native FTS 一次只能索引一个字段，
+所以标题和正文必须先并到一起再切词；没装 jieba 时退回 `search_text` + `ngram(2-3)`。
 
 **检索**：
 
 ```
 query ──┬── 向量召回（cosine，取 top 4k）
-        └── 全文召回（ngram 2-3 字分词，取 top 4k）
+        └── 全文召回（jieba 切词后查 search_tokens，取 top 4k）
                  ↓
         RRF 融合（score = Σ 1/(60+rank)）→ top k 片段
                  ↓
@@ -172,15 +190,22 @@ lance-kb/
 
 1. **`hash` 后端不等于语义搜索**。它只是字面相近的随机投影，同义改写抓不住；这种状态下检索靠全文那一路，
    `kb_stats` 会给出 caveat。想要真语义：起 Ollama 或装 fastembed，然后 `kb_reindex`。
-2. **删文件不会自动出库**。要么 `kb_sync`（会清理登记目录下已消失的文件），要么 `kb_remove`。
-3. **切块参数改了不等于旧文档变了**。`chunk_size/overlap` 只影响之后入库的文档，要统一就 `kb_reindex`。
-4. **PDF 的抽取质量取决于文件本身**。扫描件（纯图片）抽不出文字，会被记为「没有可索引的文本」；
+2. **jieba 索引和 hash 向量是两件独立的事**。jieba 只决定全文那一路的精度，向量那一路还取决于后端。
+   两个都想要最好的：装 fastembed（中文向量 bge-small-zh-v1.5）+ jieba（中文分词），然后 `kb_reindex` 一次。
+   注意 `kb_reindex` 会重算向量，换嵌入后端后必须跑。
+3. **中文分词有自己的停用词表**（`mcp/kb.py` 里的 `_STOPWORDS`）。查询里"的/怎么/需要"这类词会被挡掉，
+   只查纯停用词时会退回未过滤结果。想加行业专有词到 jieba 词典，可以用 `jieba.add_word()`，
+   在 `_jieba_mod()` 里加一行即可。
+4. **删文件不会自动出库**。要么 `kb_sync`（会清理登记目录下已消失的文件），要么 `kb_remove`。
+5. **切块参数改了不等于旧文档变了**。`chunk_size/overlap` 只影响之后入库的文档，要统一就 `kb_reindex`。
+6. **PDF 的抽取质量取决于文件本身**。扫描件（纯图片）抽不出文字，会被记为「没有可索引的文本」；
    需要 OCR 的话本插件不做。
-5. **同一路径 = 同一文档**。`doc_id` 由绝对路径哈希得到，移动文件等于新增一个文档，旧的要手工删。
-6. **库是本地快照**，不跟着源文件实时变。想保鲜就用 `kb_sync` 或建个定时任务：
+7. **同一路径 = 同一文档**。`doc_id` 由绝对路径哈希得到，移动文件等于新增一个文档，旧的要手工删。
+8. **库是本地快照**，不跟着源文件实时变。想保鲜就用 `kb_sync` 或建个定时任务：
    > 每天早上 9 点同步本地知识库，并报告新增/更新/清理了多少文档。
-7. **隐私**：默认全本地。只有显式配了 `LANCE_KB_EMBED=openai`（或设了 key 让 auto 选中它）时，
-   **片段正文会发到那个接口**。用云端 key 前请确认这一点。
+9. **隐私**：默认全本地。只有显式配了 `LANCE_KB_EMBED=openai`（或设了 key 让 auto 选中它）时，
+   **片段正文会发到那个接口**。用云端 key 前请确认这一点。fastembed 的模型也是本地 ONNX 推理，
+   只有首次下载模型会联网。
 
 ## 九、许可
 

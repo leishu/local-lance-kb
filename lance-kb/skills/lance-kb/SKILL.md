@@ -36,12 +36,16 @@ chunks  一个片段一行：chunk_id(=doc_id#序号)、doc_id、heading(小节�
 
 - `doc_id` 由文件绝对路径哈希得出，**同一路径重入库会覆盖旧记录**（不会越加越多）。
 - 笔记（`kb_add` 的 `name`+`text` 模式）`doc_path = note://<标题>`，`doc_type = note`。
-- 全文索引建在 `search_text`（小节标题 + 正文）上，中文走 `ngram(2-3)` 分词；向量列维度由嵌入后端决定。
+- 全文索引建在 `search_tokens`（jieba 切好的词，空格连接，含小节标题）上，`base_tokenizer="whitespace"`；
+  没装 jieba 时退回 `search_text` + `ngram(2-3)` 字符切片。当前是哪一种看 `kb_stats.fts_tokenizer`。
+- 向量列维度由嵌入后端决定；中文场景优先 `bge-m3`（ollama）或 `bge-small-zh-v1.5`（fastembed）。
 - 库目录可用 `LANCE_KB_HOME` 改，默认插件下 `data/`。
 
 ## 检索策略（别只会 hybrid 一把梭）
 
 1. **默认 hybrid**：向量召回 + 全文召回各取前 N，RRF 融合。多数问题的答案在这里。
+   中文查询直接写自然语言整句就行（「灰度发布失败怎么回滚」），jieba 会切词，
+   不需要先手动拆关键词。
 2. **答案里出现错别字/专有名词/代码符号**（函数名、配置项、错误码）→ `mode=keyword`，
    字面匹配比语义更可靠。
 3. **用户换着说法描述概念**（「怎么做灰度发布」→ 文档里写的是「分批上线」）→ `mode=vector`。

@@ -112,17 +112,28 @@ class FastEmbedder(Embedder):
     name = "fastembed"
 
     def __init__(self, model: str = DEFAULT_FASTEMBED_MODEL):
+        _ensure_hf_endpoint()
         try:
             from fastembed import TextEmbedding
         except ImportError as exc:  # pragma: no cover
             raise EmbedError("fastembed 未安装") from exc
         self.model = model
-        cache = os.environ.get("LANCE_KB_MODEL_CACHE") or os.path.join(
-            os.path.expanduser("~"), ".cache", "lance-kb")
+        cache = _fastembed_cache_dir()
+        prepared = _prepared_model_dir(model)
         try:
-            self._model = TextEmbedding(model_name=model, cache_dir=cache)
-        except Exception as exc:
-            raise EmbedError(f"fastembed 加载模型失败：{exc}") from exc
+            if prepared:
+                # 已经逐文件下好了，别再去撞一次镜像的 429
+                self._model = TextEmbedding(model_name=model, cache_dir=cache,
+                                            specific_model_path=prepared)
+            else:
+                self._model = TextEmbedding(model_name=model, cache_dir=cache)
+        except Exception as first:
+            try:
+                prepared = _prepare_fastembed_model(model)
+                self._model = TextEmbedding(model_name=model, cache_dir=cache,
+                                            specific_model_path=prepared)
+            except Exception as exc:
+                raise EmbedError(f"fastembed 加载模型失败：{exc}") from exc
         vec = list(self._model.embed(["probe"]))[0]
         self.dim = len(vec)
 
@@ -255,6 +266,105 @@ def ollama_available(host: str = OLLAMA_HOST, timeout: float = 1.2) -> bool:
         return False
 
 
+def _fastembed_cache_dir() -> str:
+    return os.environ.get("LANCE_KB_MODEL_CACHE") or os.path.join(
+        os.path.expanduser("~"), ".cache", "lance-kb")
+
+
+def _fastembed_model_cached(model: str = DEFAULT_FASTEMBED_MODEL) -> bool:
+    """模型是否已经落到本地 —— stats 里要区分「能离线跑」和「下次要下 100MB」。"""
+    needle = model.split("/")[-1].lower()
+    try:
+        if any(needle in name.lower() for name in os.listdir(_fastembed_cache_dir())):
+            return True
+    except Exception:
+        pass
+    return bool(_prepared_model_dir(model))
+
+
+def _model_spec(model: str) -> dict:
+    """从 fastembed 自己的模型清单里取 hf 仓库名和 onnx 文件名。"""
+    try:
+        from fastembed import TextEmbedding
+        return next((m for m in TextEmbedding.list_supported_models()
+                     if m.get("model") == model), {}) or {}
+    except Exception:
+        return {}
+
+
+def _prepared_model_dir(model: str) -> str:
+    """逐文件下载好的模型目录（存在且 onnx 就位才算数）。"""
+    spec = _model_spec(model)
+    name = spec.get("model_file")
+    if not name:
+        return ""
+    dest = os.path.join(_fastembed_cache_dir(), "models", model.replace("/", "--"))
+    path = os.path.join(dest, name)
+    try:
+        if os.path.getsize(path) > 1024:
+            return dest
+    except Exception:
+        pass
+    return ""
+
+
+def _prepare_fastembed_model(model: str) -> str:
+    """绕开 fastembed 自带的下载器，逐个文件下到固定目录，返回该目录。
+
+    为什么需要这一层：fastembed 默认走 hf 的 snapshot_download，会先调
+    `/api/models/<repo>` 查仓库元数据 —— 国内镜像对这个端点限流（429），而且
+    部分 ONNX 仓库里只有 `model_optimized.onnx`、没有它 model_file 里写的文件名，
+    整体就会抛 "Could not load model from any source"。逐文件下 + specific_model_path
+    这两点都能绕过去。
+    """
+    from huggingface_hub import hf_hub_download
+
+    spec = _model_spec(model)
+    repo = (spec.get("sources") or {}).get("hf")
+    model_file = spec.get("model_file")
+    if not repo or not model_file:
+        raise EmbedError(f"fastembed 清单里找不到 {model} 的下载源，无法预取")
+
+    dest = os.path.join(_fastembed_cache_dir(), "models", model.replace("/", "--"))
+    os.makedirs(dest, exist_ok=True)
+    names = ["config.json", "tokenizer.json", "tokenizer_config.json",
+             "special_tokens_map.json", "vocab.txt", model_file]
+    names += list(spec.get("additional_files") or [])
+    for name in names:
+        target = os.path.join(dest, name)
+        if os.path.exists(target) and os.path.getsize(target) > 0:
+            continue
+        try:
+            hf_hub_download(repo_id=repo, filename=name, local_dir=dest)
+        except Exception:
+            # 可选文件（vocab.txt 之类）缺了不影响加载，关键看 onnx 下没下来
+            continue
+    if not os.path.exists(os.path.join(dest, model_file)):
+        raise EmbedError(
+            f"模型 {model} 下载失败（源 {repo}）。国内可先 export HF_ENDPOINT=https://hf-mirror.com 再试。")
+    return dest
+
+
+def _ensure_hf_endpoint() -> None:
+    """国内机器直连 huggingface.co 基本不通，首次下 fastembed 模型会卡死。
+
+    只在用户没显式设 HF_ENDPOINT 时探测：能直连就不动，直连不通而镜像可达就切镜像。
+    两步都有超时，探测失败也不拦着 —— 让 fastembed 自己把错误抛出来更清楚。
+    """
+    if os.environ.get("HF_ENDPOINT"):
+        return
+    try:
+        urllib.request.urlopen("https://huggingface.co", timeout=1.5).close()
+        return
+    except Exception:
+        pass
+    try:
+        urllib.request.urlopen("https://hf-mirror.com", timeout=1.5).close()
+        os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
+    except Exception:
+        pass
+
+
 def _try(factory):
     try:
         return factory()
@@ -320,14 +430,22 @@ def available_backends() -> dict:
                      "detail": f"{OLLAMA_HOST} · model={DEFAULT_OLLAMA_MODEL}"}
     try:
         import fastembed  # noqa: F401
-        out["fastembed"] = {"available": True,
-                            "detail": f"model={DEFAULT_FASTEMBED_MODEL}（首次使用会下载模型）"}
+        if _fastembed_model_cached():
+            detail = f"model={DEFAULT_FASTEMBED_MODEL}（已下载，可离线）"
+        else:
+            detail = f"model={DEFAULT_FASTEMBED_MODEL}（首次使用要下约 100MB）"
+        out["fastembed"] = {"available": True, "detail": detail}
     except ImportError:
         out["fastembed"] = {"available": False, "detail": "未安装：pip install fastembed"}
     key = os.environ.get("LANCE_KB_OPENAI_KEY") or os.environ.get("OPENAI_API_KEY")
     out["openai"] = {"available": bool(key),
                      "detail": f"model={DEFAULT_OPENAI_MODEL} base={os.environ.get('LANCE_KB_OPENAI_BASE') or 'api.openai.com'}"}
     out["hash"] = {"available": True, "detail": "兜底：512 维字符 n-gram 哈希，必须配合全文检索"}
+    try:
+        import jieba  # noqa: F401
+        out["jieba"] = {"available": True, "detail": "中文分词已启用，全文索引走词级"}
+    except ImportError:
+        out["jieba"] = {"available": False, "detail": "未安装 jieba，全文索引退回 ngram(2-3)"}
     return out
 
 

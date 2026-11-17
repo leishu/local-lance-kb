@@ -6,10 +6,12 @@
 #   git clone <repo-url> lance-kb
 #
 # 用法：
-#   ./install.sh                  # 建 .venv + 装依赖 + 注册插件
+#   ./install.sh                  # 建 .venv + 装依赖（含 jieba）+ 注册插件
 #   ./install.sh --dry-run        # 只看会改什么，不落盘
 #   ./install.sh --deps-only      # 只装 Python 依赖，不动注册表
-#   ./install.sh --with-fastembed # 额外装本地嵌入模型（ONNX，首次用会下载 ~100MB 模型）
+#   ./install.sh --with-fastembed # 额外装中文向量模型（ONNX 跑 bge-small-zh-v1.5，
+#                                 # 首次用会从 HF 下 ~100MB；国内建议先 export
+#                                 # HF_ENDPOINT=https://hf-mirror.com）
 #   ./install.sh --no-deps        # 跳过依赖安装，只做注册
 #
 # 会改动 4 个注册表位置（都先备份 .bak-<时间戳>）：
@@ -74,20 +76,36 @@ install_deps() {
     else
         say "→ 复用已有虚拟环境 $VENV"
     fi
-    [ "$DRY" = 1 ] && { say "[dry-run] pip install lancedb pypdf python-docx"; return 0; }
+    [ "$DRY" = 1 ] && { say "[dry-run] pip install lancedb pypdf python-docx jieba"; return 0; }
 
     # /tmp 常常是 10MB 的 tmpfs，pip 解包会直接失败，所以把临时目录放到插件下
     mkdir -p "$SCRIPT_DIR/.pip-tmp"
     TMPDIR="$SCRIPT_DIR/.pip-tmp" "$VENV/bin/python" -m pip install -q --upgrade pip || true
-    PKGS="lancedb pypdf python-docx"
+    # jieba 是中文分词的关键：没它全文索引只能退回 ngram(2-3) 字符切片
+    PKGS="lancedb pypdf python-docx jieba"
     [ "$WITH_FE" = 1 ] && PKGS="$PKGS fastembed"
     say "→ 安装：$PKGS（lancedb 体积较大，首次约 100~150MB，请耐心等）"
     # shellcheck disable=SC2086
     TMPDIR="$SCRIPT_DIR/.pip-tmp" "$VENV/bin/python" -m pip install $PKGS
     rmdir "$SCRIPT_DIR/.pip-tmp" 2>/dev/null || true
 
-    say "→ 自检："
-    "$VENV/bin/python" - <<'PY' || true
+    if [ "$WITH_FE" = 1 ]; then
+        say "→ 预取中文嵌入模型 bge-small-zh-v1.5（约 90MB；直连不通会自动切 hf-mirror）"
+        mkdir -p "$SCRIPT_DIR/.pip-tmp"
+        TMPDIR="$SCRIPT_DIR/.pip-tmp" PYTHONPATH="$SCRIPT_DIR/mcp" \
+            "$VENV/bin/python" - <<'PY' || true
+import os
+os.environ.setdefault("HF_HUB_DOWNLOAD_TIMEOUT", "60")
+try:
+    import embedders
+    print("  ✓ 模型就绪：", embedders._prepare_fastembed_model("BAAI/bge-small-zh-v1.5"))
+except Exception as exc:
+    print("  · 预取没成功（第一次检索时会重试）：", exc)
+PY
+        rmdir "$SCRIPT_DIR/.pip-tmp" 2>/dev/null || true
+    fi
+
+    say "→ 自检："    "$VENV/bin/python" - <<'PY' || true
 import sys
 print("  Python", sys.version.split()[0])
 try:
@@ -97,7 +115,15 @@ except Exception as exc:
     print("  × lancedb 不可用：", exc)
 for mod, label, hint in (("pypdf", "PDF 解析", "PDF 会被跳过"),
                          ("docx", "DOCX 解析", "DOCX 会被跳过"),
-                         ("fastembed", "本地嵌入", "只能用 ollama / openai / 兜底 hash")):
+                         ("jieba", "中文分词", "全文索引退回 ngram(2-3) 字符切片"),
+                         ("fastembed", "中文语义向量", "向量回落 hash，只能靠全文检索")):
+    if mod == "jieba":
+        try:
+            import jieba
+            print(f"  ✓ {label}（jieba {jieba.__version__}）")
+        except Exception:
+            print(f"  · {label} 不可用（缺 jieba：{hint}）")
+        continue
     try:
         __import__(mod)
         print(f"  ✓ {label}（{mod}）")

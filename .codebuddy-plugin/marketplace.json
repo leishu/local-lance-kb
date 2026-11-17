@@ -5,7 +5,7 @@
     {
       "name": "lance-kb",
       "source": "./lance-kb",
-      "version": "0.1.0",
+      "version": "0.2.0",
       "description": "本地知识库：把本机文档（md/txt/pdf/docx/html/csv/json/代码）切块向量化进 LanceDB，提供混合检索（向量 + 全文 RRF）、带出处的片段回取、增量同步与文档管理，以及一个可浏览的库看板（MCP App）。全程离线。"
     }
   ]

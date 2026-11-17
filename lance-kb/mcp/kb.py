@@ -130,6 +130,9 @@ def _schema(dim: int):
         pa.field("heading", pa.string()),
         pa.field("text", pa.string()),
         pa.field("search_text", pa.string()),
+        # jieba 切好的词（空格连接），全文索引建在它上面。
+        # 没装 jieba 时为空串，索引退回 search_text + ngram。
+        pa.field("search_tokens", pa.string()),
         pa.field("ordinal", pa.int32()),
         pa.field("n_chars", pa.int32()),
         pa.field("tags", pa.string()),
@@ -171,11 +174,11 @@ def embedder() -> embedders.Embedder:
         want = cfg.get("embedder") or {}
         prefer = os.environ.get("LANCE_KB_EMBED") or "auto"
         emb = embedders.resolve(prefer)
-        known = want.get("name")
-        if known and known != "auto" and prefer == "auto" and known != emb.name:
-            # config 记的是 fastembed，但这台机器上没装 → 说明换了环境，
-            # 维度大概率对不上，交给 ensure() 报警，不在这里静默改配置
-            pass
+        # 记住「上一个后端是什么」：hash 和 bge-small-zh 都是 512 维，只看维度
+        # 发现不了后端被换过，必须比对身份，否则新旧向量会静默混在一个表里。
+        _STATE["embedder_was"] = dict(want) if want else {}
+        _STATE["embedder_changed"] = bool(want.get("name")) and (
+            want.get("name") != emb.name or (want.get("model") or "") != emb.model)
         _STATE["embedder"] = emb
         if not want or want.get("dim") != emb.dim or want.get("name") != emb.name:
             cfg["embedder"] = emb.info()
@@ -200,8 +203,10 @@ def ensure_tables() -> tuple:
         chunks = handle.create_table(T_CHUNKS, schema=_schema(emb.dim))
     else:
         dim = _vector_dim(chunks)
-        if dim and dim != emb.dim:
-            # 空库直接换维度重来 —— 用户常是先装插件、后配 ollama/fastembed，
+        stale = COL_TOKENS not in {f.name for f in chunks.schema}
+        switched = bool(_STATE.get("embedder_changed"))
+        if (dim and dim != emb.dim) or stale or switched:
+            # 空库直接换维度/换结构重来 —— 用户常是先装插件、后配 ollama/fastembed/jieba，
             # 这时逼他 reindex 一个空库纯属添堵。
             try:
                 empty = chunks.count_rows() == 0
@@ -210,6 +215,17 @@ def ensure_tables() -> tuple:
             if empty:
                 handle.drop_table(T_CHUNKS)
                 chunks = handle.create_table(T_CHUNKS, schema=_schema(emb.dim))
+            elif stale:
+                raise NeedReindex(
+                    "库是旧版表结构（缺 search_tokens 列，切词索引建不起来）。"
+                    "跑一次 kb_reindex 重建即可，原始文件会重新解析一遍。")
+            elif switched:
+                was = _STATE.get("embedder_was") or {}
+                raise NeedReindex(
+                    f"库里的向量是 {was.get('name')}/{was.get('model')} 生成的，"
+                    f"当前后端换成了 {emb.name}/{emb.model}。"
+                    f"两者维度可能一样，但向量空间不同，混着查结果会串味 —— "
+                    f"跑一次 kb_reindex 重建即可。")
             else:
                 raise NeedReindex(
                     f"库里的向量是 {dim} 维，当前嵌入后端 {emb.name}/{emb.model} 是 {emb.dim} 维。"
@@ -317,6 +333,7 @@ def _write_doc(chunks_tbl, docs_tbl, doc: dict, chunks: list[dict], emb) -> None
                 "heading": c["heading"] or "",
                 "text": c["text"],
                 "search_text": (c["heading"] + "\n" if c["heading"] else "") + c["text"],
+                "search_tokens": index_tokens(c["heading"], c["text"]),
                 "ordinal": n,
                 "n_chars": len(c["text"]),
                 "tags": doc["tags"],
@@ -427,7 +444,7 @@ def add_paths(paths, tags=None, force=False, recursive=True, chunk_size=None,
     if record_source:
         _record_source(cfg, paths, tag_str)
     if build_fts:
-        _ensure_fts(chunks_tbl, rebuild=report["chunks"] > 0)
+        report["fts"] = _ensure_fts(chunks_tbl, rebuild=report["chunks"] > 0)
     report["elapsed_sec"] = round(time.time() - started, 2)
     report["total_docs"] = docs_tbl.count_rows()
     return report
@@ -506,50 +523,133 @@ def _record_source(cfg: dict, paths, tags: str) -> None:
 
 
 # --------------------------------------------------------------------------- #
+# 中文分词（jieba）
+# --------------------------------------------------------------------------- #
+#
+# LanceDB 0.4x 的 native FTS 没有 jieba，只有 simple/raw/whitespace/ngram/icu，
+# 而 icu 不支持 language="Chinese"；simple 按空白切词，整段中文会变成一个 token。
+# 想在中文上做真正的词级索引只能自己切：入库时把 jieba 切好的词用空格连成一列
+# （search_tokens），索引建在它上面并指定 base_tokenizer="whitespace" —— 此时每个
+# 词对 tantivy 来说就是一个 token，BM25 就是在中文词上算的。
+# 查询必须走同一个 tokenize()，两端切法不一致的话 BM25 永远对不上。
+
+COL_TOKENS = "search_tokens"
+COL_TEXT = "search_text"
+
+_JIEBA = None
+_JIEBA_TRIED = False
+
+# 高频但几乎没有区分度的词：留着只会稀释 BM25，挡住真正的关键词
+_STOPWORDS = frozenset("""
+的 了 是 在 和 与 及 或 而 也 都 就 很 太 更 最 有 没有 无 不 没 我 你 他 她 它
+我们 你们 他们 咱们 这 那 这个 那个 这些 那些 一个 一些 什么 怎么 怎样 如何
+为什么 可以 需要 应该 要 会 能 可能 得 对 从 到 把 被 让 给 为 以 于 上 下 里 中
+内 外 自己 但 但是 因为 所以 如果 虽然 然后 已经 还是 就是 这样 那样 时候 之后 之前
+吗 呢 吧 啊 呀 嘛 哦 嗯 着 过 咱们 各位 请问 一下 一些 一点
+""".split())
+
+# tantivy 的 QueryParser 把 AND/OR/NOT 当布尔运算符，混进查询词会改变语义
+_RESERVED = frozenset({"and", "or", "not"})
+
+_JUNK_RE = re.compile(r"^[\W_]+$", re.UNICODE)
+
+
+def _jieba_mod():
+    """惰性加载 jieba；没装返回 None，全文索引自动退回 ngram 方案。"""
+    global _JIEBA, _JIEBA_TRIED
+    if not _JIEBA_TRIED:
+        _JIEBA_TRIED = True
+        try:
+            import jieba
+            jieba.setLogLevel(60)   # 别让「Building prefix dict」刷进 MCP 的 stderr
+            jieba.initialize()      # 预加载词典，省得第一次查询卡两秒
+            _JIEBA = jieba
+        except Exception:
+            _JIEBA = None
+    return _JIEBA
+
+
+def jieba_available() -> bool:
+    return _jieba_mod() is not None
+
+
+def tokenize(text: str, for_query: bool = False) -> list[str]:
+    """把文本切成词。
+
+    索引和查询共用这一个函数。查询端用搜索引擎模式（长词再切出短词，提高召回），
+    并额外挡掉布尔运算符和停用词 —— 只查「怎么用」这类整句停用词时退回未过滤结果，
+    免得查询变成空串直接零召回。
+    """
+    jb = _jieba_mod()
+    text = (text or "").strip()
+    if jb is None or not text:
+        return []
+    cut = jb.cut_for_search if for_query else jb.cut
+    kept, loose = [], []
+    for word in cut(text):
+        word = (word or "").strip().lower()
+        if not word or _JUNK_RE.match(word):
+            continue
+        loose.append(word)
+        if word in _STOPWORDS or word in _RESERVED:
+            continue
+        kept.append(word)
+    return kept or [w for w in loose if w not in _RESERVED]
+
+
+def index_tokens(heading: str, text: str) -> str:
+    """入库用的切词结果（空格连接）。没装 jieba 时返回空串，由 ngram 方案接手。"""
+    return " ".join(tokenize(((heading or "") + "\n" if heading else "") + (text or "")))
+
+
+# --------------------------------------------------------------------------- #
 # 全文索引
 # --------------------------------------------------------------------------- #
 
-def _fts_label(tbl) -> str:
-    """已建索引时把分词器名字读回来，别在 stats 里显示 "existing" 这种内部状态。"""
+def _fts_index_info(tbl) -> dict:
+    """读回表上真实存在的全文索引：建在哪一列、用的什么分词器。
+
+    查询端必须按它来 —— 库是按 ngram 建的、后来才装 jieba，也不能突然换列去查。
+    """
     try:
         for idx in tbl.list_indices():
-            name = (getattr(idx, "name", "") or "").upper()
-            kind = (getattr(idx, "index_type", "") or "").upper()
-            if not ("FTS" in name or "FTS" in kind or "INVERTED" in kind
-                    or name.startswith("SEARCH_TEXT")):
+            kind = str(getattr(idx, "index_type", "") or "").upper()
+            name = str(getattr(idx, "name", "") or "")
+            if not ("FTS" in kind or "INVERTED" in kind or "FTS" in name.upper()):
                 continue
             details = getattr(idx, "index_details", None) or {}
-            if isinstance(details, dict):
-                base = details.get("base_tokenizer")
-                if base == "ngram":
-                    lo = details.get("min_ngram_length")
-                    hi = details.get("max_ngram_length")
-                    if lo and hi:
-                        return f"ngram({lo}-{hi})"
-                if base:
-                    return str(base)
-            return "已建立"
+            cols = getattr(idx, "columns", None)
+            if not cols and isinstance(details, dict):
+                cols = details.get("columns")
+            column = (cols[0] if isinstance(cols, (list, tuple)) and cols
+                      else (name[:-4] if name.endswith("_idx") else name) or COL_TEXT)
+            base = details.get("base_tokenizer") if isinstance(details, dict) else None
+            if column == COL_TOKENS:
+                label = "jieba"
+            elif base == "ngram":
+                lo = details.get("min_ngram_length") if isinstance(details, dict) else None
+                hi = details.get("max_ngram_length") if isinstance(details, dict) else None
+                label = f"ngram({lo}-{hi})" if lo and hi else "ngram"
+            else:
+                label = str(base or "已建立")
+            return {"column": column, "base": base,
+                    "jieba": column == COL_TOKENS, "label": label}
     except Exception:
         pass
-    return ""
+    return {}
 
 
-def _fts_config():
-    """全文索引配置。
+def _fts_label(tbl) -> str:
+    return (_fts_index_info(tbl) or {}).get("label", "")
 
-    LanceDB 0.4x 的 native FTS 只认 simple/raw/whitespace/ngram/icu 这几种分词器，
-    没有 jieba（icu 也不支持 Chinese 语言）；而 simple 按空白切词，中文整段会变成
-    一个 token，等于搜不到。所以中文场景唯一可用的是 ngram（2~3 字），代价是索引更大。
-    """
-    from lancedb.index import FTS
-    kind = (load_config().get("fts") or os.environ.get("LANCE_KB_FTS") or "ngram").lower()
-    if kind in ("simple", "raw", "whitespace"):
-        return FTS(base_tokenizer=kind), kind
-    return FTS(base_tokenizer="ngram", ngram_min_length=2, ngram_max_length=3), "ngram(2-3)"
+
+def _fts_pref() -> str:
+    """auto（默认）/ jieba / ngram，也可用环境变量 LANCE_KB_FTS 临时覆盖。"""
+    return (os.environ.get("LANCE_KB_FTS") or (load_config().get("fts") or "auto")).lower()
 
 
 def _ensure_fts(tbl, rebuild: bool = True) -> str:
-    """给 search_text 建全文索引（标题 + 正文，一个字段，native FTS 不支持多字段）。
+    """建全文索引：有 jieba 就切词后建 whitespace 索引，否则退回 ngram。
 
     rebuild=False 时只在还没索引时才建 —— 每批入库都重建索引太贵。
     """
@@ -559,10 +659,24 @@ def _ensure_fts(tbl, rebuild: bool = True) -> str:
             _STATE["fts"] = label
             return label
 
+    from lancedb.index import FTS
+    pref = _fts_pref()
+    if pref in ("auto", "jieba", "") and jieba_available():
+        column, cfg, label = COL_TOKENS, FTS(base_tokenizer="whitespace"), "jieba"
+    elif pref == "jieba":
+        # 明确要 jieba 却不装，就别悄悄退回 ngram 让人以为分词生效了
+        _STATE["fts_error"] = "配置指定了 jieba，但当前解释器没有 jieba（.venv/bin/pip install jieba）"
+        _STATE["fts"] = ""
+        return ""
+    else:
+        column, cfg = COL_TEXT, FTS(base_tokenizer="ngram",
+                                   ngram_min_length=2, ngram_max_length=3)
+        label = "ngram(2-3)"
+
     try:
-        cfg, label = _fts_config()
-        tbl.create_index("search_text", config=cfg)
+        tbl.create_index(column, config=cfg)
         _STATE["fts"] = label
+        _STATE.pop("fts_error", None)
         return label
     except ImportError:
         pass
@@ -573,7 +687,7 @@ def _ensure_fts(tbl, rebuild: bool = True) -> str:
     # 老 API 兜底（lancedb < 0.25）
     for tokenizer in ("ngram", "simple"):
         try:
-            tbl.create_fts_index("search_text", replace=True, tokenizer_name=tokenizer)
+            tbl.create_fts_index(COL_TEXT, replace=True, tokenizer_name=tokenizer)
             _STATE["fts"] = tokenizer
             return tokenizer
         except Exception:
@@ -634,8 +748,17 @@ def _vector_search(tbl, vec, k, where: str):
 
 
 def _fts_search(tbl, query, k, where: str):
+    """全文召回。建的是 jieba 索引就把查询也切词，否则把原句交给 ngram。"""
+    info = _fts_index_info(tbl)
+    column = info.get("column") or COL_TEXT
+    fts_query = query
+    if info.get("jieba"):
+        words = tokenize(query, for_query=True)
+        if not words:
+            return []
+        fts_query = " ".join(words)
     try:
-        q = tbl.search(query, query_type="fts", fts_columns="search_text").limit(k)
+        q = tbl.search(fts_query, query_type="fts", fts_columns=column).limit(k)
         if where:
             try:
                 q = q.where(where, prefilter=True)
@@ -986,9 +1109,18 @@ def stats(include_backends: bool = True) -> dict:
     }
     if include_backends:
         info["backends"] = embedders.available_backends()
+    if _STATE.get("fts_error"):
+        info["fts_error"] = _STATE["fts_error"]
     if emb.name == "hash":
-        info["caveat"] = ("当前用的是兜底哈希向量（没有语义泛化能力），检索质量主要靠全文检索那一路。"
-                          "想要更好的语义召回：本机起 ollama 拉 bge-m3，或安装 fastembed，然后 kb_reindex。")
+        caveat = ("当前用的是兜底哈希向量（没有语义泛化能力），检索质量主要靠全文检索那一路。"
+                  "想要更好的语义召回：本机起 ollama 拉 bge-m3，或安装 fastembed，然后 kb_reindex。")
+        if fts and fts != "jieba":
+            caveat += (f"全文检索当前走 {fts}；装上 jieba 后会换成中文分词索引"
+                       f"（.venv/bin/pip install jieba，再 kb_reindex）。")
+        info["caveat"] = caveat
+    elif fts and fts != "jieba" and jieba_available():
+        info["caveat"] = (f"全文索引还是 {fts}，但环境里已经有 jieba —— "
+                          f"跑一次 kb_reindex 就能换成 jieba 中文分词索引。")
     return info
 
 
